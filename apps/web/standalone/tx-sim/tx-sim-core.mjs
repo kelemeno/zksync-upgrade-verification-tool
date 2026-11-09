@@ -51,6 +51,7 @@ const FIELDS = new Set([
   "description",
   "tag",
   "valueToMint",
+  "timeIncrease",
   ...FLAGS,
   ...FEES,
 ]);
@@ -102,6 +103,15 @@ export function parseTransactions(_json) {
       requireThat(
         _tx[field] === undefined || typeof _tx[field] === "string",
         `${prefix}${field} must be text.`
+      );
+    // Simulation-only: the simulator advances its fork's clock by this many seconds before the
+    // call. On chain the operator waits instead; the target contract enforces the delay itself.
+    if (_tx.timeIncrease !== undefined)
+      requireThat(
+        Number.isSafeInteger(_tx.timeIncrease)
+          ? _tx.timeIncrease >= 0
+          : typeof _tx.timeIncrease === "string" && /^(0|[1-9]\d*)$/.test(_tx.timeIncrease),
+        `${prefix}timeIncrease must be a whole number of seconds.`
       );
     const valueWei = ethToWei(_tx.value);
     const fees = {};

@@ -174,10 +174,12 @@ test("source flags exclude test/deployment calls without changing real fields", 
         skipPriorityOps: true,
         emulateAllBatchesExecuted: true,
         valueToMint: "1",
+        timeIncrease: 1200,
       },
     ])
   );
   assert.equal(result.rows.length, 1);
+  assert.equal(result.rows[0].timeIncrease, 1200);
   assert.equal(result.skipped.length, 2);
   assert.deepEqual(walletTransaction(result.rows[0]), {
     from: raw.from,
@@ -194,6 +196,8 @@ test("source flags exclude test/deployment calls without changing real fields", 
     { gasLimit: "123" },
     { maxFeePerGas: 20000000000 },
     { gasPrice: "1", maxFeePerGas: "2" },
+    { timeIncrease: -1 },
+    { timeIncrease: "soon" },
   ])
     assert.throws(() => parseTransactions(JSON.stringify([{ ...raw, ...change }])));
 });

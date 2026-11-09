@@ -131,6 +131,34 @@ against the chain 312 diamond on L1 before constructing `startUpgrade`. Approval
 apply; the verifier handles Council/Guardian approvals. Older Board-based v33 upgrade bundles are
 marked superseded for this normal voting workflow.
 
+### A normal upgrade end to end
+
+Used for the v0.34.0 Era testnet 3 upgrade (transaction-simulator #397). Each stage of an upgrade runs:
+
+1. **L2 governance**, from the voting file: `propose`, `vote_for`, `queue`, `execute_l2`. Chain 312 only seals a
+   block when a transaction arrives, so the governor can stay Pending past its opening time or Active past its
+   deadline. The governor panel then offers **Send 0 ETH to yourself to produce a new block**.
+2. **Receive on L1.** Each proposal in the voting file is followed by a `stageN_start_upgrade` row. It is a placeholder
+   until **Build startUpgrade with the inclusion proof** reads the L2 execute receipt, verifies the message's inclusion
+   on L1 and fills in `PUH.startUpgrade`. The proof needs the L2 batch executed on L1; an executed proposal's panel
+   offers **Send a large L2→L1 message to fill the batch** to seal it sooner (the size steps down until the wallet
+   accepts the request).
+3. **Security Council approval**, in the stage's `stageN_puh_execute` panel while the PUH reports Waiting for approval:
+   each member Safe owned 1-of-1 by the connected account gets **Sign with this Safe** (`execTransaction` of
+   `SignMessageLib.signMessage(digest)`), then **Send approveUpgradeSecurityCouncil** passes the signed Safes in member
+   order with empty signatures.
+4. **`PUH.execute`.** The upgrade file's calls whose source sender is the PUH are wrapped per stage as
+   `PUH.execute(UpgradeProposal{calls, executor 0, salt 0})`; the panel checks the upgrade ID against the voting file,
+   sends only when the PUH reports Ready, and waits for a governance timer deadline when the stage calls
+   `checkDeadline`.
+
+The page leaves out calls no wallet sends: the simulator's bare `sendToL1` files (placeholder sender `0xdeadbeaf…`),
+`test_create_chain`/`test_upgrade_chain` calls, and `ChainAdmin.setUpgradeTimestamp` (the node reads the
+ServerNotifier's timestamp). `timeIncrease` is accepted as a simulation-only field.
+
+The top bar picks the wallet (**Connect MetaMask** or **Connect Rabby**) and switches to, or adds, the selected call's
+network. Each call then has only **Simulate** and **Send**.
+
 Tests (no private key or broadcast):
 
 ```sh

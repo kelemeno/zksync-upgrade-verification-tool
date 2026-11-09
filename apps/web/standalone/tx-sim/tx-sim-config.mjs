@@ -21,6 +21,31 @@ export const ADDRESSES = Object.freeze({
   board: "0x7E1Ba159c077F333A6B269e15D8A5a12916E6Fc2",
   messenger: "0x0000000000000000000000000000000000008008",
   diamond: "0xbb94d8f4080d5cd34d6215399f26771990f38a1d",
+  // transaction-simulator's `construct-protocol-upgrade-proposal` writes its bare
+  // `L1Messenger.sendToL1` files from this unowned address; the real call comes from the timelock.
+  proposalPlaceholderSender: "0xdeadbeaf00000000000000000000000000000000",
+  securityCouncil: "0x2498CAc75FA29b5c30e126C23ABcCc5ac5119821",
+  // Safe v1.3.0 SignMessageLib (canonical deployment), delegatecalled by the member Safes.
+  signMessageLib: "0xA65387F16B013cf2Af4605Ad8aA5ec25a2cbA3a2",
+});
+// SecurityCouncil: 8 member Safes, 4 approvals per upgrade, EIP-712 domain "SecurityCouncil" "1".
+export const COUNCIL = Object.freeze({
+  members: 8,
+  threshold: 4,
+  domainName: "SecurityCouncil",
+  domainVersion: "1",
+  approveTypehash: "ApproveUpgradeSecurityCouncil(bytes32 id)",
+});
+export const SAFE_DELEGATECALL = 1;
+// ChainAdmin.setUpgradeTimestamp(uint256,uint256) called directly on a ChainAdmin. The node reads the
+// ServerNotifier's UpgradeTimestampUpdated event (set through ChainAdmin.multicall), so the
+// ChainAdmin's own timestamp is not sent.
+export const CHAIN_ADMIN_SET_UPGRADE_TIMESTAMP = "0xe2a9d554";
+// GovernanceUpgradeTimer.checkDeadline() and deadline(): a stage that calls checkDeadline reverts
+// (DeadlineNotYetPassed) until the timer started by an earlier stage has run out.
+export const TIMER = Object.freeze({
+  checkDeadlineSelector: "0x43bf9936",
+  deadlineSelector: "0x29dcb0cf",
 });
 export const LIMITS = Object.freeze({
   maxFileBytes: 8 * 1024 * 1024,
@@ -31,6 +56,11 @@ export const LIMITS = Object.freeze({
   gasMarginPercent: 120n,
   percent: 100n,
   receiptConfirmations: 1n,
+  // Chain 312 seals an L1 batch at 700,000 bytes of pubdata. A 300,000-byte L2->L1 message
+  // costs about 65M L2 gas, under the 80M transaction cap. MetaMask rejects large requests
+  // ("Request too large"), so the filler steps down through these sizes until one is accepted.
+  batchPubdataLimitBytes: 700000,
+  batchFillerMessageBytes: [300000, 150000, 100000, 60000, 30000],
 });
 export const STORAGE = Object.freeze({
   journal: "tx-sim:v1:journal",

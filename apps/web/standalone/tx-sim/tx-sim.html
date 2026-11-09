@@ -26,6 +26,9 @@
       <div class="network-pill">Sepolia</div>
       <div id="wallet-state">Wallet disconnected</div>
       <button id="connect" class="primary">Connect MetaMask</button>
+      <button id="connect-rabby" hidden>Connect Rabby</button>
+      <button id="switch-network" hidden>Switch network</button>
+      <button id="add-network" hidden>Add network to wallet</button>
       <button id="connect-walletconnect" hidden>Connect Safe / WalletConnect</button>
     </div>
     <nav aria-label="Governance navigation">
@@ -57,6 +60,7 @@
         >
       </div>
       <div id="notice" role="status" aria-live="polite" hidden></div>
+      <p id="wallet-activity" class="warning" role="status" aria-live="polite" hidden></p>
       <section class="card source">
         <div>
           <strong id="source-title">Loading PR #386…</strong>

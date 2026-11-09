@@ -4430,5 +4430,194 @@
       "stateMutability": "nonpayable",
       "type": "function"
     }
+  ],
+  "SecurityCouncil": [
+    {
+      "type": "function",
+      "name": "approveUpgradeSecurityCouncil",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        {
+          "type": "bytes32",
+          "name": "_id",
+          "internalType": "bytes32"
+        },
+        {
+          "type": "address[]",
+          "name": "_signers",
+          "internalType": "address[]"
+        },
+        {
+          "type": "bytes[]",
+          "name": "_signatures",
+          "internalType": "bytes[]"
+        }
+      ],
+      "outputs": []
+    },
+    {
+      "type": "function",
+      "name": "members",
+      "stateMutability": "view",
+      "inputs": [
+        {
+          "type": "uint256",
+          "name": "",
+          "internalType": "uint256"
+        }
+      ],
+      "outputs": [
+        {
+          "type": "address",
+          "name": "",
+          "internalType": "address"
+        }
+      ]
+    }
+  ],
+  "GnosisSafeV130": [
+    {
+      "type": "function",
+      "name": "execTransaction",
+      "stateMutability": "payable",
+      "inputs": [
+        {
+          "type": "address",
+          "name": "to",
+          "internalType": "address"
+        },
+        {
+          "type": "uint256",
+          "name": "value",
+          "internalType": "uint256"
+        },
+        {
+          "type": "bytes",
+          "name": "data",
+          "internalType": "bytes"
+        },
+        {
+          "type": "uint8",
+          "name": "operation",
+          "internalType": "uint8"
+        },
+        {
+          "type": "uint256",
+          "name": "safeTxGas",
+          "internalType": "uint256"
+        },
+        {
+          "type": "uint256",
+          "name": "baseGas",
+          "internalType": "uint256"
+        },
+        {
+          "type": "uint256",
+          "name": "gasPrice",
+          "internalType": "uint256"
+        },
+        {
+          "type": "address",
+          "name": "gasToken",
+          "internalType": "address"
+        },
+        {
+          "type": "address",
+          "name": "refundReceiver",
+          "internalType": "address"
+        },
+        {
+          "type": "bytes",
+          "name": "signatures",
+          "internalType": "bytes"
+        }
+      ],
+      "outputs": [
+        {
+          "type": "bool",
+          "name": "success",
+          "internalType": "bool"
+        }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "getOwners",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [
+        {
+          "type": "address[]",
+          "name": "",
+          "internalType": "address[]"
+        }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "getThreshold",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [
+        {
+          "type": "uint256",
+          "name": "",
+          "internalType": "uint256"
+        }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "getMessageHash",
+      "stateMutability": "view",
+      "inputs": [
+        {
+          "type": "bytes",
+          "name": "message",
+          "internalType": "bytes"
+        }
+      ],
+      "outputs": [
+        {
+          "type": "bytes32",
+          "name": "",
+          "internalType": "bytes32"
+        }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "signedMessages",
+      "stateMutability": "view",
+      "inputs": [
+        {
+          "type": "bytes32",
+          "name": "",
+          "internalType": "bytes32"
+        }
+      ],
+      "outputs": [
+        {
+          "type": "uint256",
+          "name": "",
+          "internalType": "uint256"
+        }
+      ]
+    }
+  ],
+  "SignMessageLib": [
+    {
+      "type": "function",
+      "name": "signMessage",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        {
+          "type": "bytes",
+          "name": "_data",
+          "internalType": "bytes"
+        }
+      ],
+      "outputs": []
+    }
   ]
 }

@@ -6,6 +6,10 @@ import {
   GOVERNOR_STATES,
   UPGRADE_STATES,
   UPGRADE_TUPLE,
+  COUNCIL,
+  SAFE_DELEGATECALL,
+  TIMER,
+  CHAIN_ADMIN_SET_UPGRADE_TIMESTAMP,
 } from "./tx-sim-config.mjs";
 import {
   same,
@@ -64,12 +68,17 @@ function notice(_text, _error = false) {
   $("notice").hidden = !_text;
 }
 let busy = false;
+let walletActivity = null;
 let provider = null;
 let account = "";
 let walletChain = null;
 let snapshot;
 let c;
 let bundles = [];
+let hiddenPlaceholderFiles = [];
+const puhStates = new Map();
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+const ZERO_HASH = `0x${"0".repeat(64)}`;
 let selectedBundle = 0;
 let selectedRow = 0;
 let activeView = "bundle";
@@ -125,6 +134,13 @@ async function run(_fn) {
     render();
   }
 }
+async function review(_fn) {
+  try {
+    await _fn();
+  } catch (_error) {
+    notice(_error.message, true);
+  }
+}
 async function rpc(_network, _method, _params = []) {
   const url = rpcs[_network] || CHAINS[_network].rpc;
   try {
@@ -166,6 +182,26 @@ function findMetaMask() {
   return candidates.find(
     (_p) => _p?.isMetaMask && !_p.isBraveWallet && !_p.isRabby && !_p.isCoinbaseWallet
   );
+}
+function findRabby() {
+  if (discovered.has("io.rabby")) return discovered.get("io.rabby");
+  const candidates = window.ethereum?.providers ?? [window.ethereum];
+  return candidates.find((_p) => _p?.isRabby);
+}
+// Rabby next to MetaMask: the chosen button binds its extension for that send, so either wallet
+// can submit any call (for example to compare how fast each one submits).
+async function useWallet(_found, _label) {
+  requireThat(_found, `${_label} extension was not detected in this browser.`);
+  walletBridge = null;
+  bindProvider(_found);
+  walletLabel = _label;
+  await provider.request({ method: "eth_requestAccounts" });
+  await refreshWallet();
+  notice(`${_label} connected: ${account}. Choose a call and send it when ready.`);
+}
+// The network of the call on screen; the top bar switches to it or offers it to the wallet.
+function selectedCallRow() {
+  return activeView === "normal" ? normalSelected : bundles[selectedBundle]?.rows[selectedRow];
 }
 window.addEventListener("eip6963:announceProvider", (_event) => {
   const detail = _event.detail;
@@ -229,6 +265,7 @@ async function connect() {
     "MetaMask extension was not detected. Open this URL in your desktop browser with MetaMask enabled."
   );
   bindProvider(found);
+  walletLabel = "MetaMask";
   await provider.request({ method: "eth_requestAccounts" });
   await refreshWallet();
   notice(
@@ -323,6 +360,38 @@ function importedGovernorContext(_row) {
         `Voting deadline: ${governorTime(state.deadline, state.mode)}. Late quorum may extend this deadline.`
       )
     );
+  // The governor reads its clock from the latest L2 block, and chain 312 only seals a block when
+  // a transaction arrives. Once the opening time has passed by the wall clock, offer to send a
+  // 0 ETH self-transfer so the next block moves the clock. Voting still waits for Active.
+  const lagging = staleGovernorPhase(state);
+  if (lagging)
+    panel.append(
+      el(
+        "p",
+        { class: "warning" },
+        `The ${lagging} time has passed, but the latest L2 block is from ${governorTime(state.clock, state.mode)}. The governor keeps its current state until a newer block exists.`
+      ),
+      el(
+        "button",
+        { disabled: busy, onclick: () => run(() => sealNewBlock(_row)) },
+        "Send 0 ETH to yourself to produce a new block"
+      )
+    );
+  // Executed on L2: its L2->L1 message is only provable once its batch is sealed and executed on
+  // L1. A quiet chain seals slowly, so offer messages large enough to fill the batch.
+  if (state.state === 7)
+    panel.append(
+      el(
+        "p",
+        {},
+        `L2 execution is complete. Its L2→L1 message is provable once its batch is sealed and executed on L1. To seal the batch sooner, send large L2→L1 messages from your connected account until ${LIMITS.batchPubdataLimitBytes.toLocaleString()} bytes of pubdata fill it.`
+      ),
+      el(
+        "button",
+        { disabled: busy, onclick: () => run(() => sendBatchFiller(_row)) },
+        "Send a large L2→L1 message to fill the batch"
+      )
+    );
   if (canRepropose(state.state))
     panel.append(
       el(
@@ -336,6 +405,77 @@ function importedGovernorContext(_row) {
       )
     );
   return { panel, blocked: governorActionReason(state) };
+}
+// Pending past its opening time, or Active past its deadline: the governor state only moves once
+// the chain seals a block whose timestamp is past that point.
+function staleGovernorPhase(_state) {
+  if (!_state?.mode?.includes("mode=timestamp")) return "";
+  const now = Date.now() / 1000;
+  if (_state.state === 0 && now > Number(_state.snapshot)) return "voting opening";
+  if (_state.state === 1 && now > Number(_state.deadline)) return "voting deadline";
+  return "";
+}
+async function sendBatchFiller(_row) {
+  notice("Preparing the large L2→L1 message…");
+  requireThat(provider && account, "Connect your wallet first.");
+  await refreshWallet();
+  if (walletChain !== _row.chainId) {
+    notice(`Switch MetaMask to ${CHAINS[_row.network].name} (${_row.chainId}) to continue.`);
+    await switchChain(_row);
+  }
+  let hash;
+  let size;
+  for (size of LIMITS.batchFillerMessageBytes) {
+    notice(
+      `Opening MetaMask: confirm a ${size.toLocaleString()}-byte L2→L1 message. It only adds pubdata to the open batch. If no popup appears, open MetaMask from the toolbar.`
+    );
+    try {
+      hash = await provider.request({
+        method: "eth_sendTransaction",
+        params: [
+          {
+            from: account,
+            to: ADDRESSES.messenger,
+            data: c.encode("IL1Messenger", "sendToL1", [`0x${"ab".repeat(size)}`]),
+            value: "0x0",
+            chainId: hex(_row.chainId),
+          },
+        ],
+      });
+      break;
+    } catch (_error) {
+      if (!/too large/i.test(_error?.message ?? "")) throw _error;
+    }
+  }
+  requireThat(hash, "MetaMask rejected every message size as too large.");
+  const needed = Math.ceil(LIMITS.batchPubdataLimitBytes / size);
+  notice(`Sent ${hash}. Waiting for it to be mined…`);
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const receipt = await rpc(_row.network, "eth_getTransactionReceipt", [hash]);
+    if (receipt?.blockNumber) break;
+    await new Promise((_resolve) => setTimeout(_resolve, 2000));
+  }
+  const sealed = BigInt(await rpc(_row.network, "zks_L1BatchNumber"));
+  notice(
+    `Mined ${hash} (${size.toLocaleString()} bytes). Latest sealed L2 batch: ${sealed}. At this size about ${needed} messages fill a batch; send more until the batch holding the L2 execution is sealed.`
+  );
+}
+async function sealNewBlock(_row) {
+  requireThat(provider && account, "Connect your wallet first.");
+  await switchChain(_row);
+  notice("Confirm the 0 ETH self-transfer in your wallet. It only produces a new L2 block.");
+  const hash = await provider.request({
+    method: "eth_sendTransaction",
+    params: [{ from: account, to: account, value: "0x0", chainId: hex(_row.chainId) }],
+  });
+  notice(`Sent ${hash}. Waiting for it to be mined, then reading the governor again…`);
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const receipt = await rpc(_row.network, "eth_getTransactionReceipt", [hash]);
+    if (receipt?.blockNumber) break;
+    await new Promise((_resolve) => setTimeout(_resolve, 2000));
+  }
+  importedGovernors.delete(_row.id);
+  await refreshImportedGovernor(_row);
 }
 async function prepareImportedRetry(_row) {
   const family = upgradeSources(bundles, vote, c);
@@ -410,6 +550,23 @@ async function guardImportedGovernor(_row) {
   requireThat(state, importedGovernors.get(_row.id)?.error || "Could not verify governor state.");
   requireThat(!governorActionReason(state), governorActionReason(state));
 }
+function chainParams(_network) {
+  const chain = CHAINS[_network];
+  return {
+    chainId: hex(chain.id),
+    chainName: chain.name,
+    rpcUrls: [rpcs[_network] || chain.rpc],
+    blockExplorerUrls: [chain.explorer],
+    nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+  };
+}
+// Offers the call's network to a wallet (wallet_addEthereumChain); the wallet shows its own prompt.
+async function addChainTo(_wallet, _label, _row) {
+  requireThat(_wallet, `${_label} extension was not detected in this browser.`);
+  await _wallet.request({ method: "eth_requestAccounts" });
+  await _wallet.request({ method: "wallet_addEthereumChain", params: [chainParams(_row.network)] });
+  notice(`${CHAINS[_row.network].name} offered to ${_label}. Approve it there, then switch to it.`);
+}
 async function switchChain(_row) {
   requireThat(provider, "Connect your wallet first.");
   const chain = CHAINS[_row.network];
@@ -419,26 +576,28 @@ async function switchChain(_row) {
       params: [{ chainId: hex(chain.id) }],
     });
   } catch (_error) {
-    if (_error.code !== 4902) throw _error;
+    // MetaMask reports an unknown chain as 4902; Rabby and others use other codes. Anything but an
+    // explicit rejection gets one attempt to add the chain, which also switches to it.
+    if (_error.code === 4001) throw _error;
     await provider.request({
       method: "wallet_addEthereumChain",
-      params: [
-        {
-          chainId: hex(chain.id),
-          chainName: chain.name,
-          rpcUrls: [rpcs[_row.network] || chain.rpc],
-          blockExplorerUrls: [chain.explorer],
-          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-        },
-      ],
+      params: [chainParams(_row.network)],
     });
     await provider.request({
       method: "wallet_switchEthereumChain",
       params: [{ chainId: hex(chain.id) }],
     });
   }
-  await refreshWallet();
-  requireThat(walletChain === _row.chainId, "The wallet has not switched to the required network.");
+  // Some wallets report the new chain a moment after the request resolves.
+  for (let attempt = 0; attempt < 10; attempt++) {
+    await refreshWallet();
+    if (walletChain === _row.chainId) break;
+    await new Promise((_resolve) => setTimeout(_resolve, 300));
+  }
+  requireThat(
+    walletChain === _row.chainId,
+    `The wallet is still on chain ${walletChain}. Switch it to ${chain.name} (${chain.id}) in the wallet for this site; Rabby only offers testnets once they are enabled in its settings.`
+  );
 }
 function link(_text, _url) {
   return el("a", { href: _url, target: "_blank", rel: "noopener" }, _text);
@@ -454,19 +613,544 @@ function setView(_view) {
   render();
 }
 
+function puhExecuteRow({ puhStage: _stage, puhCalls: _calls }) {
+  const payload = {
+    calls: _calls.map((_call) => ({ target: _call.to, value: _call.valueWei, data: _call.data })),
+    executor: ZERO_ADDRESS,
+    salt: ZERO_HASH,
+  };
+  const row = actionRow(
+    c,
+    "execute",
+    [payload],
+    `${_stage}: PUH.execute of its ${_calls.length} calls`,
+    "sepolia",
+    ADDRESSES.puh,
+    "ProtocolUpgradeHandlerV31"
+  );
+  return {
+    ...row,
+    tag: `${_stage}_puh_execute`,
+    sourceIndex: _calls[0].sourceIndex,
+    puhUpgradeId: c.utils.keccak256(c.utils.defaultAbiCoder.encode([UPGRADE_TUPLE], [payload])),
+    puhCalls: _calls,
+  };
+}
+// The timer deadline a stage waits for, if one of its calls is checkDeadline: read from that timer.
+async function stageTimerDeadline(_row) {
+  const timerCall = _row.puhCalls.find((_call) =>
+    same(_call.data.slice(0, 10), TIMER.checkDeadlineSelector)
+  );
+  if (!timerCall) return null;
+  const deadline = BigInt(
+    await rpc("sepolia", "eth_call", [{ to: timerCall.to, data: TIMER.deadlineSelector }, "latest"])
+  );
+  const block = await rpc("sepolia", "eth_getBlockByNumber", ["latest", false]);
+  return { deadline, chainTime: BigInt(block.timestamp) };
+}
+async function puhUpgradeState(_row) {
+  const [state] = await c.read(
+    rpc,
+    "sepolia",
+    "ProtocolUpgradeHandlerV31",
+    ADDRESSES.puh,
+    "upgradeState",
+    [_row.puhUpgradeId]
+  );
+  return Number(state);
+}
+function puhExecuteContext(_row) {
+  if (!_row.puhUpgradeId) return null;
+  let entry = puhStates.get(_row.id);
+  if (!entry) {
+    puhStates.set(_row.id, { loading: true });
+    Promise.all([puhUpgradeState(_row), stageTimerDeadline(_row)])
+      .then(([_state, _timer]) => puhStates.set(_row.id, { state: _state, timer: _timer }))
+      .catch((_error) => puhStates.set(_row.id, { error: _error.message }))
+      .finally(render);
+    entry = { loading: true };
+  }
+  const proposed = voteCandidates().some((_candidate) =>
+    same(makeVote(_candidate.payload, _candidate.description, c).upgradeId, _row.puhUpgradeId)
+  );
+  const panel = el(
+    "section",
+    { class: "step" },
+    el("h3", {}, "Live L1 upgrade state"),
+    el("p", { class: "mono" }, `Upgrade ID: ${_row.puhUpgradeId}`),
+    el(
+      "p",
+      { class: proposed ? "" : "warning" },
+      proposed
+        ? "Matches the UpgradeProposal of an L2 proposal in this PR."
+        : "No L2 proposal in this PR carries this UpgradeProposal, so the PUH cannot have started it."
+    ),
+    el("ol", {}, ..._row.puhCalls.map((_call) => el("li", {}, _call.description || _call.to))),
+    el(
+      "button",
+      {
+        disabled: busy || entry.loading,
+        onclick: () =>
+          run(async () => {
+            puhStates.delete(_row.id);
+            const [state, timer] = await Promise.all([
+              puhUpgradeState(_row),
+              stageTimerDeadline(_row),
+            ]);
+            puhStates.set(_row.id, { state, timer });
+          }),
+      },
+      "Refresh L1 upgrade state"
+    )
+  );
+  if (entry.error) return { panel, blocked: `Could not read the L1 upgrade state: ${entry.error}` };
+  if (entry.loading) return { panel, blocked: "Reading the L1 upgrade state…" };
+  panel.append(el("p", {}, `State: ${UPGRADE_STATES[entry.state]}`));
+  // The next step for each PUH state, so this panel always offers what to send next.
+  if (entry.state === 0 && proposed)
+    panel.append(
+      el(
+        "p",
+        {},
+        "Next: startUpgrade. It proves on L1 that the governor's timelock sent this UpgradeProposal from L2."
+      ),
+      el(
+        "button",
+        { class: "primary", disabled: busy, onclick: () => run(() => prepareStartFor(_row)) },
+        "Build startUpgrade for this stage"
+      )
+    );
+  if (entry.state === 1)
+    panel.append(el("p", {}, "Legal veto period: the Security Council can approve once it ends."));
+  if (entry.state === 2) panel.append(councilSection(_row));
+  if (entry.state === 3)
+    panel.append(el("p", {}, "Approved. PUH.execute opens once the execution delay has passed."));
+  const waiting =
+    entry.timer && (entry.timer.deadline === 0n || entry.timer.chainTime < entry.timer.deadline);
+  if (entry.timer)
+    panel.append(
+      el(
+        "p",
+        { class: waiting ? "warning" : "" },
+        entry.timer.deadline === 0n
+          ? "This stage checks the governance timer, which an earlier stage has not started yet."
+          : waiting
+            ? `Governance timer: this stage reverts (DeadlineNotYetPassed) until ${new Date(Number(entry.timer.deadline) * 1000).toLocaleString(undefined, { timeZoneName: "short" })}, ${entry.timer.deadline - entry.timer.chainTime} s after the latest L1 block. Refresh after that.`
+            : "Governance timer: its deadline has passed."
+      )
+    );
+  if (entry.state === 4 && !waiting)
+    panel.append(el("p", {}, "Next: send this PUH.execute below."));
+  return {
+    panel,
+    blocked:
+      entry.state === 4 && waiting
+        ? "Wait for the governance timer deadline before sending."
+        : entry.state === 4
+          ? ""
+          : `PUH.execute needs the upgrade to be Ready; it is ${UPGRADE_STATES[entry.state]}. Start it with startUpgrade in the L2 → L1 workflow and collect the Security Council approval first.`,
+  };
+}
+// Security Council approval of one PUH upgrade: each member Safe marks the council's EIP-712
+// digest as signed on chain (SignMessageLib via delegatecall, sent by its owner), then anyone
+// submits approveUpgradeSecurityCouncil with those Safes in member order and empty signatures,
+// which the Safes validate against their signed messages (EIP-1271).
+const councilStates = new Map();
+function councilDigest(_upgradeId) {
+  const coder = c.utils.defaultAbiCoder;
+  const domain = c.utils.keccak256(
+    coder.encode(
+      ["bytes32", "bytes32", "bytes32", "uint256", "address"],
+      [
+        c.utils.id(
+          "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+        ),
+        c.utils.id(COUNCIL.domainName),
+        c.utils.id(COUNCIL.domainVersion),
+        CHAINS.sepolia.id,
+        ADDRESSES.securityCouncil,
+      ]
+    )
+  );
+  const struct = c.utils.keccak256(
+    coder.encode(["bytes32", "bytes32"], [c.utils.id(COUNCIL.approveTypehash), _upgradeId])
+  );
+  return c.utils.solidityKeccak256(["bytes2", "bytes32", "bytes32"], ["0x1901", domain, struct]);
+}
+async function loadCouncil(_upgradeId) {
+  const digest = councilDigest(_upgradeId);
+  const read = async (_abi, _to, _method, _args = []) =>
+    (await c.read(rpc, "sepolia", _abi, _to, _method, _args))[0];
+  const members = [];
+  for (let index = 0; index < COUNCIL.members; index++) {
+    const safe = await read("SecurityCouncil", ADDRESSES.securityCouncil, "members", [index]);
+    const [owners, threshold, messageHash] = await Promise.all([
+      read("GnosisSafeV130", safe, "getOwners"),
+      read("GnosisSafeV130", safe, "getThreshold"),
+      read("GnosisSafeV130", safe, "getMessageHash", [digest]),
+    ]);
+    const signed = await read("GnosisSafeV130", safe, "signedMessages", [messageHash]);
+    members.push({
+      safe,
+      owners,
+      threshold: Number(threshold),
+      messageHash,
+      signed: !signed.isZero(),
+    });
+  }
+  return { digest, members };
+}
+async function councilRow(_tag, _to, _data, _description, _upgradeId) {
+  const [row] = parseTransactions(
+    JSON.stringify([
+      {
+        network: "sepolia",
+        from: account,
+        to: _to,
+        value: "0",
+        data: _data,
+        description: _description,
+        tag: _tag,
+      },
+    ])
+  ).rows;
+  return (await identifyRows([row], `council:${_upgradeId}:${_tag}`))[0];
+}
+async function councilSign(_upgradeId, _member) {
+  requireThat(provider && account, "Connect your wallet first.");
+  const { digest } = councilStates.get(_upgradeId);
+  // A 1-of-1 Safe accepts its owner's own call as the signature: r = owner, s = 0, v = 1.
+  const ownerSignature = c.utils.hexConcat([c.utils.hexZeroPad(account, 32), ZERO_HASH, "0x01"]);
+  const data = c.encode("GnosisSafeV130", "execTransaction", [
+    ADDRESSES.signMessageLib,
+    0,
+    c.encode("SignMessageLib", "signMessage", [digest]),
+    SAFE_DELEGATECALL,
+    0,
+    0,
+    0,
+    ZERO_ADDRESS,
+    ZERO_ADDRESS,
+    ownerSignature,
+  ]);
+  const row = await councilRow(
+    `council_sign_${_member.safe}`,
+    _member.safe,
+    data,
+    `Security Council member Safe ${_member.safe} signs the approval of ${_upgradeId}`,
+    _upgradeId
+  );
+  await refreshWallet();
+  if (walletChain !== row.chainId) await switchChain(row);
+  await send(row, async () => {});
+  councilStates.set(_upgradeId, await loadCouncil(_upgradeId));
+}
+async function councilApprove(_row) {
+  requireThat(provider && account, "Connect your wallet first.");
+  const council = await loadCouncil(_row.puhUpgradeId);
+  const signers = council.members
+    .filter((_member) => _member.signed)
+    .map((_member) => _member.safe);
+  requireThat(
+    signers.length >= COUNCIL.threshold,
+    `Only ${signers.length} of the required ${COUNCIL.threshold} member Safes have signed.`
+  );
+  const data = c.encode("SecurityCouncil", "approveUpgradeSecurityCouncil", [
+    _row.puhUpgradeId,
+    signers,
+    signers.map(() => "0x"),
+  ]);
+  const row = await councilRow(
+    "council_approve",
+    ADDRESSES.securityCouncil,
+    data,
+    `Security Council approves ${_row.puhUpgradeId} (${signers.length} signed Safes)`,
+    _row.puhUpgradeId
+  );
+  await refreshWallet();
+  if (walletChain !== row.chainId) await switchChain(row);
+  await send(row, async () => {});
+  puhStates.delete(_row.id);
+}
+function councilSection(_row) {
+  const id = _row.puhUpgradeId;
+  const section = el("div", { class: "step" }, el("strong", {}, "Next: Security Council approval"));
+  const council = councilStates.get(id);
+  if (!council) {
+    councilStates.set(id, { loading: true });
+    loadCouncil(id)
+      .then((_council) => councilStates.set(id, _council))
+      .catch((_error) => councilStates.set(id, { error: _error.message }))
+      .finally(render);
+  }
+  if (!council || council.loading) {
+    section.append(el("p", {}, "Reading the member Safes…"));
+    return section;
+  }
+  if (council.error) {
+    section.append(el("p", { class: "warning" }, `Could not read the Council: ${council.error}`));
+    return section;
+  }
+  const signedCount = council.members.filter((_member) => _member.signed).length;
+  section.append(
+    el(
+      "p",
+      {},
+      `${signedCount} of ${COUNCIL.threshold} required member Safes have signed digest ${council.digest}. Each signature is a transaction from the Safe's owner.`
+    ),
+    el(
+      "ol",
+      {},
+      ...council.members.map((_member) => {
+        const canSign =
+          !_member.signed &&
+          _member.threshold === 1 &&
+          _member.owners.some((_owner) => same(_owner, account));
+        return el(
+          "li",
+          {},
+          `${_member.safe} · ${_member.signed ? "signed ✓" : `not signed (owner ${_member.owners.join(", ")}, threshold ${_member.threshold})`} `,
+          canSign && signedCount < COUNCIL.threshold
+            ? el(
+                "button",
+                { disabled: busy, onclick: () => run(() => councilSign(id, _member)) },
+                "Sign with this Safe"
+              )
+            : ""
+        );
+      })
+    ),
+    el(
+      "button",
+      {
+        class: "primary",
+        disabled: busy || signedCount < COUNCIL.threshold,
+        onclick: () => run(() => councilApprove(_row)),
+      },
+      `Send approveUpgradeSecurityCouncil (${signedCount}/${COUNCIL.threshold} signed)`
+    ),
+    el(
+      "button",
+      {
+        disabled: busy,
+        onclick: () =>
+          run(async () => {
+            councilStates.set(id, await loadCouncil(id));
+          }),
+      },
+      "Refresh Council state"
+    )
+  );
+  return section;
+}
+// Every normal upgrade proposal sends its UpgradeProposal L2 → L1 when the governor executes it;
+// receiving it on L1 is PUH.startUpgrade with the message's inclusion proof. Each proposal in a
+// file therefore gets a startUpgrade row after its L2 calls. The row is a placeholder until the
+// proof can be built, which needs the L2 execution's batch executed on L1.
+async function startUpgradePlaceholders(_rows) {
+  const placeholders = [];
+  const seen = new Set();
+  for (const row of _rows) {
+    const vote = proposalFromCall(row, c);
+    if (!vote || seen.has(vote.upgradeId)) continue;
+    seen.add(vote.upgradeId);
+    const stage = (row.tag ?? "upgrade").replace(/_propose$/, "");
+    const [placeholder] = parseTransactions(
+      JSON.stringify([
+        {
+          network: "sepolia",
+          from: ADDRESSES.control,
+          to: ADDRESSES.puh,
+          value: "0",
+          data: "0x",
+          description: `${stage}: receive the L2 → L1 message on L1 (PUH.startUpgrade with its inclusion proof)`,
+          tag: `${stage}_start_upgrade`,
+        },
+      ])
+    ).rows;
+    const [identified] = await identifyRows([placeholder], `start:${vote.upgradeId}`);
+    // It is gated by its own L2 execution and the PUH state, not by the file's other receipts.
+    independentCalls.add(identified.id);
+    placeholders.push({ ...identified, startFor: vote });
+  }
+  return placeholders;
+}
+async function l2ExecutionHash(_proposalId) {
+  const executeRow = bundles
+    .flatMap((_bundle) => _bundle.rows)
+    .find((_candidateRow) => {
+      const action = governorAction(_candidateRow, c);
+      return action?.method === "execute" && BigInt(action.proposalId) === BigInt(_proposalId);
+    });
+  const saved = executeRow ? current(executeRow.id)?.hash : undefined;
+  if (saved) return saved;
+  const logs = await rpc("zksync-testnet3", "eth_getLogs", [
+    {
+      address: ADDRESSES.governor,
+      fromBlock: "0x0",
+      toBlock: "latest",
+      topics: [c.utils.id("ProposalExecuted(uint256)")],
+    },
+  ]);
+  return logs.find((_log) => BigInt(_log.data) === BigInt(_proposalId))?.transactionHash;
+}
+async function buildStartFor(_row) {
+  const vote = _row.startFor;
+  const hash = await l2ExecutionHash(vote.proposalId);
+  requireThat(hash, "The L2 proposal has not been executed yet: send its execute call first.");
+  const executeRow = voteRows(vote, c).find((_candidate) => _candidate.tag === "execute");
+  return buildStart(vote, executeRow, hash, rpc, c);
+}
+const startStates = new Map();
+function startUpgradeContext(_row, _bundle) {
+  if (!_row.startFor) return null;
+  const vote = _row.startFor;
+  let entry = startStates.get(_row.id);
+  if (!entry) {
+    startStates.set(_row.id, { loading: true });
+    c.read(rpc, "sepolia", "ProtocolUpgradeHandlerV31", ADDRESSES.puh, "upgradeState", [
+      vote.upgradeId,
+    ])
+      .then(([_state]) => startStates.set(_row.id, { state: Number(_state) }))
+      .catch((_error) => startStates.set(_row.id, { error: _error.message }))
+      .finally(render);
+    entry = { loading: true };
+  }
+  const panel = el(
+    "section",
+    { class: "step" },
+    el("h3", {}, "Receive on L1"),
+    el("p", { class: "mono" }, `Upgrade ID: ${vote.upgradeId}`)
+  );
+  if (entry.error) return { panel, blocked: `Could not read the L1 upgrade state: ${entry.error}` };
+  if (entry.loading) return { panel, blocked: "Reading the L1 upgrade state…" };
+  panel.append(el("p", {}, `L1 upgrade state: ${UPGRADE_STATES[entry.state]}`));
+  if (entry.state > 0)
+    return {
+      panel,
+      blocked:
+        journal[_row.id]?.status === "confirmed"
+          ? ""
+          : "Already started on L1. Continue with the Council approval and PUH.execute in the main upgrade file.",
+    };
+  const built = _row.data !== "0x";
+  panel.append(
+    el(
+      "p",
+      {},
+      built
+        ? "Built from the L2 execution receipt; the inclusion proof is verified against L1."
+        : "Builds startUpgrade from the L2 execute receipt. It needs that L2 batch executed on L1."
+    ),
+    el(
+      "button",
+      {
+        class: built ? "" : "primary",
+        disabled: busy,
+        onclick: () =>
+          run(async () => {
+            const start = await buildStartFor(_row, _bundle);
+            const index = _bundle.rows.findIndex((_candidate) => _candidate.id === _row.id);
+            _bundle.rows[index] = { ...start.row, id: _row.id, tag: _row.tag, startFor: vote };
+            notice(
+              `L2 → L1 proof verified: batch ${start.batch}, proof index ${start.proofId}. Review and send startUpgrade.`
+            );
+          }),
+      },
+      built ? "Rebuild startUpgrade" : "Build startUpgrade with the inclusion proof"
+    )
+  );
+  return { panel, blocked: built ? "" : "Build the startUpgrade transaction first." };
+}
+// Loads this stage's L2 proposal into the L2 → L1 workflow, takes its L2 execution hash from the
+// imported governor `execute` row's receipt, and builds startUpgrade with the inclusion proof.
+async function prepareStartFor(_row) {
+  const candidate = voteCandidates().find((_candidate) =>
+    same(makeVote(_candidate.payload, _candidate.description, c).upgradeId, _row.puhUpgradeId)
+  );
+  requireThat(candidate, "No L2 proposal in this PR carries this UpgradeProposal.");
+  const { proposalId } = makeVote(candidate.payload, candidate.description, c);
+  const executeRow = bundles
+    .flatMap((_bundle) => _bundle.rows)
+    .find((_candidateRow) => {
+      const action = governorAction(_candidateRow, c);
+      return action?.method === "execute" && BigInt(action.proposalId) === BigInt(proposalId);
+    });
+  let executionHash = executeRow ? current(executeRow.id)?.hash : undefined;
+  if (!executionHash) {
+    const logs = await rpc("zksync-testnet3", "eth_getLogs", [
+      {
+        address: ADDRESSES.governor,
+        fromBlock: "0x0",
+        toBlock: "latest",
+        topics: [c.utils.id("ProposalExecuted(uint256)")],
+      },
+    ]);
+    executionHash = logs.find((_log) => BigInt(_log.data) === BigInt(proposalId))?.transactionHash;
+  }
+  $("payload").value = JSON.stringify(candidate.payload, null, 2);
+  $("description").value = candidate.description;
+  await prepareVote();
+  if (executionHash) $("execution-hash").value = executionHash;
+  requireThat(
+    $("execution-hash").value.trim(),
+    "Paste this stage's L2 execute transaction hash into the workflow's execution hash field, then build the proof there."
+  );
+  await prepareProof();
+}
+function isProposalPlaceholder(_row) {
+  return (
+    same(_row.from, ADDRESSES.proposalPlaceholderSender) &&
+    same(_row.to, ADDRESSES.messenger) &&
+    same(_row.data.slice(0, 10), c.interfaces.IL1Messenger.getSighash("sendToL1"))
+  );
+}
 async function useSnapshot(_snapshot) {
   requireThat(
     /^[0-9a-f]{40}$/.test(_snapshot.commit) && Array.isArray(_snapshot.stages),
     "Invalid PR snapshot."
   );
   const next = [];
+  const hidden = [];
   for (const source of _snapshot.stages) {
     requireThat(
       (await sha256(source.raw)) === source.sha256,
       `Source hash differs for ${source.path}.`
     );
     const parsed = parseTransactions(source.raw);
+    // Bare `sendToL1` files from the simulator's placeholder sender only document the message the
+    // governor's timelock sends; no wallet can send them, so they are not listed.
+    if (parsed.rows.length > 0 && parsed.rows.every(isProposalPlaceholder)) {
+      hidden.push(source.path);
+      continue;
+    }
+    // The PUH is the source sender of each stage's calls: they run inside one
+    // `PUH.execute(UpgradeProposal{calls, executor 0, salt 0})`, which any account sends once the
+    // upgrade is Ready. test_* calls are the simulator's own chain checks, sent by ChainAdmin contracts.
+    const sendable = [];
+    for (const row of parsed.rows) {
+      if (/^test_(create|upgrade)_chain/.test(row.tag ?? "")) {
+        parsed.skipped.push({ index: row.sourceIndex, reason: "Simulation-only test call" });
+        continue;
+      }
+      if (same(row.data.slice(0, 10), CHAIN_ADMIN_SET_UPGRADE_TIMESTAMP)) {
+        parsed.skipped.push({
+          index: row.sourceIndex,
+          reason: "ChainAdmin timestamp (the node reads the ServerNotifier's)",
+        });
+        continue;
+      }
+      if (!same(row.from, ADDRESSES.puh)) {
+        sendable.push(row);
+        continue;
+      }
+      const last = sendable.at(-1);
+      if (last?.puhStage === row.tag) last.puhCalls.push(row);
+      else sendable.push({ puhStage: row.tag, puhCalls: [row] });
+    }
+    parsed.rows = sendable.map((_item) => (_item.puhCalls ? puhExecuteRow(_item) : _item));
     const rows = await identifyRows(parsed.rows, `${_snapshot.repo}:${source.path}`);
+    rows.push(...(await startUpgradePlaceholders(rows)));
     // The user chose normal L2 voting. Old v33 Board calls must not masquerade as that route.
     const superseded = rows.some(
       (_row) => _row.tag === "v33_ecosystem_execute" && same(_row.to, ADDRESSES.board)
@@ -475,6 +1159,7 @@ async function useSnapshot(_snapshot) {
   }
   snapshot = _snapshot;
   bundles = next;
+  hiddenPlaceholderFiles = hidden;
   selectedBundle = 0;
   selectedRow = 0;
   gates.clear();
@@ -564,7 +1249,11 @@ function voteCandidates() {
       )
         continue;
       const decoded = c.interfaces.Testnet3Governor.decodeFunctionData("propose", row.data);
-      add(decodeProposal(decoded[0], decoded[1], decoded[2], decoded[3]), bundle.title);
+      // One file can propose several stages: label each by its row tag and description.
+      add(
+        decodeProposal(decoded[0], decoded[1], decoded[2], decoded[3]),
+        row.tag ? `${row.tag} (${bundle.title})` : bundle.title
+      );
     }
   function walk(_value, _path) {
     if (!_value || typeof _value !== "object") return;
@@ -807,21 +1496,30 @@ async function send(_row, _guard) {
     navigator.locks,
     "This browser does not support the execution lock. Use an up-to-date desktop browser."
   );
-  await navigator.locks.request(STORAGE.lock, { ifAvailable: true }, async (_lock) => {
-    requireThat(_lock, "Another tab is already opening a wallet request. Finish it first.");
-    notice(`Checking the sender, chain, contract execution and gas for ${_row.description}…`);
-    const hash = await sendOne({
-      provider,
-      row: _row,
-      beforeSend: _guard,
-      save,
-      current,
-      readProvider: simulationProvider(_row),
-      progress: notice,
+  walletActivity = _row;
+  render();
+  try {
+    await navigator.locks.request(STORAGE.lock, { ifAvailable: true }, async (_lock) => {
+      requireThat(_lock, "Another tab is already opening a wallet request. Finish it first.");
+      notice(`Checking the sender, chain, contract execution and gas for ${_row.description}…`);
+      const hash = await sendOne({
+        provider,
+        row: _row,
+        beforeSend: _guard,
+        save,
+        current,
+        readProvider: simulationProvider(_row),
+        progress: notice,
+      });
+      notice(
+        `Submitted ${hash}. You can submit another independent call while this one is pending.`
+      );
+      await checkRow(_row);
     });
-    notice(`Submitted ${hash}. You can submit another independent call while this one is pending.`);
-    await checkRow(_row);
-  });
+  } finally {
+    walletActivity = null;
+    render();
+  }
 }
 async function checkRow(_row) {
   const entry = current(_row.id);
@@ -862,37 +1560,21 @@ function renderTransaction(_panel, _row, _guard, _blocked = "") {
   const walletOk = requirement === null;
   const walletReason =
     requirement === "connect"
-      ? `This page is not connected to a wallet. Connect your ${walletLabel} to continue.`
+      ? "This page is not connected to a wallet. Connect MetaMask or Rabby at the top."
       : requirement === "account"
         ? `This page sees ${account}. Connect the required sender ${_row.from}. A Safe sends from its own address; it cannot substitute for the voting EOA.`
         : requirement === "network"
-          ? `Your wallet is on chain ${walletChain}. Switch to ${CHAINS[_row.network].name} (${_row.chainId}) to continue.`
+          ? `Your wallet is on chain ${walletChain}. Switch to ${CHAINS[_row.network].name} (${_row.chainId}) with the button at the top.`
           : "";
   if (_blocked) _panel.append(el("p", { class: "warning" }, _blocked));
   if (walletReason) _panel.append(el("p", { class: "warning" }, walletReason));
   const actions = el("div", { class: "actions" });
-  if (requirement === "connect")
-    actions.append(
-      el(
-        "button",
-        { class: "primary", disabled: busy, onclick: () => run(connect) },
-        walletBridge ? "Connect via WalletConnect" : "Connect MetaMask to continue"
-      )
-    );
   if (requirement === "account")
     actions.append(
       el(
         "button",
         { class: "primary", disabled: busy, onclick: () => run(chooseAccount) },
         walletBridge ? "Reconnect the required account" : "Choose account in MetaMask"
-      )
-    );
-  if (provider && walletChain !== _row.chainId)
-    actions.append(
-      el(
-        "button",
-        { disabled: busy, onclick: () => run(() => switchChain(_row)) },
-        `Switch to ${CHAINS[_row.network].name}`
       )
     );
   actions.append(
@@ -946,7 +1628,11 @@ function renderTransaction(_panel, _row, _guard, _blocked = "") {
           `${entry.hash.slice(0, 14)}… · View transaction ↗`,
           `${CHAINS[_row.network].explorer}/tx/${entry.hash}`
         ),
-        el("button", { disabled: busy, onclick: () => run(() => checkRow(_row)) }, "Check receipt")
+        el(
+          "button",
+          { disabled: false, onclick: () => review(() => checkRow(_row)) },
+          "Check receipt"
+        )
       );
   }
   const attach = el(
@@ -987,9 +1673,9 @@ function renderTransaction(_panel, _row, _guard, _blocked = "") {
     el(
       "button",
       {
-        disabled: busy,
+        disabled: false,
         onclick: () =>
-          run(async () => {
+          review(async () => {
             await navigator.clipboard.writeText(_row.data);
             notice("Calldata copied.");
           }),
@@ -998,6 +1684,14 @@ function renderTransaction(_panel, _row, _guard, _blocked = "") {
     )
   );
   _panel.append(raw);
+  if (_row.timeIncrease !== undefined)
+    _panel.append(
+      el(
+        "p",
+        { class: "warning" },
+        `The simulation advanced time by ${_row.timeIncrease} s before this call. On chain, wait at least that long after the call it depends on; sending earlier reverts.`
+      )
+    );
   if (_row.skipPriorityOps || _row.emulateAllBatchesExecuted || _row.valueToMint)
     _panel.append(
       el(
@@ -1205,7 +1899,7 @@ function renderNormal() {
       "button",
       {
         class: `call-button ${normalSelected?.id === row.id ? "active" : ""}`,
-        disabled: busy,
+        disabled: false,
         onclick: () => {
           relaySelected = false;
           normalSelected = row;
@@ -1226,7 +1920,7 @@ function renderNormal() {
       "button",
       {
         class: `call-button ${relaySelected ? "active" : ""}`,
-        disabled: busy,
+        disabled: false,
         onclick: () => {
           relaySelected = true;
           normalSelected = start?.row ?? null;
@@ -1307,6 +2001,14 @@ function renderNormal() {
 function renderBundles() {
   const list = $("bundles");
   list.replaceChildren(el("h2", {}, "Transaction files"));
+  if (hiddenPlaceholderFiles.length)
+    list.append(
+      el(
+        "p",
+        { title: hiddenPlaceholderFiles.join("\n") },
+        `${hiddenPlaceholderFiles.length} proposal message file(s) hidden: their sendToL1 is sent by the governor's timelock on execute.`
+      )
+    );
   const family = upgradeSources(bundles, vote, c);
   const familyIndices = new Set(family.map((_source) => _source.index));
   let workflowAdded = false;
@@ -1320,7 +2022,7 @@ function renderBundles() {
         {
           id: "upgrade-workflow",
           class: `bundle-button ${activeView === "normal" ? "active" : ""}`,
-          disabled: busy,
+          disabled: false,
           onclick: () => {
             setView("normal");
             if (!vote) $("proposal-settings").open = true;
@@ -1349,7 +2051,7 @@ function renderBundles() {
         "button",
         {
           class: `bundle-button ${activeView === "bundle" && _index === selectedBundle ? "active" : ""}`,
-          disabled: busy,
+          disabled: false,
           onclick: () => {
             selectedBundle = _index;
             selectedRow = Math.max(
@@ -1379,7 +2081,7 @@ function renderBundles() {
     el(
       "p",
       {},
-      `${bundle.rows.length} executable calls · ${bundle.skipped.length} source-marked test/already-executed calls excluded.`
+      `${bundle.rows.length} executable calls · ${bundle.skipped.length} excluded (${[...new Set(bundle.skipped.map((_skip) => _skip.reason))].join(", ") || "none"}).`
     )
   );
   if (bundle.path && snapshot)
@@ -1425,7 +2127,7 @@ function renderBundles() {
         "button",
         {
           class: `call-button ${_index === selectedRow ? "active" : ""}`,
-          disabled: busy,
+          disabled: false,
           onclick: () => {
             selectedRow = _index;
             render();
@@ -1442,14 +2144,15 @@ function renderBundles() {
     $("transaction").replaceChildren(el("p", {}, "No executable calls in this file."));
     return;
   }
-  const governance = importedGovernorContext(row);
+  const governance =
+    importedGovernorContext(row) ?? puhExecuteContext(row) ?? startUpgradeContext(row, bundle);
   let blocked = bundle.superseded
     ? "This is the superseded Board-based v33 route."
     : bundle.gate && !gates.has(bundle.sha256)
       ? "Confirm the bundle prerequisites above first."
       : "";
   if (!blocked && governance?.blocked) blocked = governance.blocked;
-  const plan = dependencyPlan(bundle.rows, selectedRow, independentCalls.has(row.id));
+  const plan = dependencyPlan(bundle.rows, bundle.rows.indexOf(row), independentCalls.has(row.id));
   if (!blocked && plan.indices.some((_i) => journal[bundle.rows[_i].id]?.status !== "confirmed"))
     blocked = `Waiting for required calls ${plan.indices
       .filter((_i) => journal[bundle.rows[_i].id]?.status !== "confirmed")
@@ -1508,9 +2211,24 @@ function renderBundles() {
         "Confirm the bundle prerequisites first."
       );
       await guardImportedGovernor(row);
+      if (row.startFor) {
+        requireThat(row.data !== "0x", "Build the startUpgrade transaction first.");
+        const rebuilt = await buildStartFor(row, bundle);
+        requireThat(
+          same(rebuilt.row.data, row.data),
+          "The proof changed; build startUpgrade again."
+        );
+      }
+      if (row.puhUpgradeId) {
+        const state = await puhUpgradeState(row);
+        requireThat(
+          state === 4,
+          `PUH.execute needs the upgrade to be Ready; it is ${UPGRADE_STATES[state]}.`
+        );
+      }
       await verifyDependencies(
         bundle.rows,
-        dependencyPlan(bundle.rows, selectedRow, independentCalls.has(row.id)).indices,
+        dependencyPlan(bundle.rows, bundle.rows.indexOf(row), independentCalls.has(row.id)).indices,
         readStored(STORAGE.journal, {}),
         rpc,
         save,
@@ -1527,13 +2245,32 @@ function render() {
   $("bundle-view").hidden = activeView !== "bundle";
   for (const element of document.querySelectorAll("button, input, textarea, select"))
     element.disabled = busy;
+  $("export-progress").disabled = false;
+  const activity = $("wallet-activity");
+  activity.hidden = !walletActivity;
+  if (walletActivity) {
+    const awaiting = journal[walletActivity.id]?.status === "awaiting";
+    activity.textContent = `${awaiting ? "Waiting for MetaMask" : "Processing wallet request"}: ${walletActivity.description}. You can review other calls. Finish this request before sending another.`;
+  }
   $("wallet-state").textContent = account
-    ? `${account.slice(0, 8)}…${account.slice(-4)} · chain ${walletChain}`
+    ? `${walletLabel}: ${account.slice(0, 8)}…${account.slice(-4)} · chain ${walletChain}`
     : "Wallet disconnected";
+  const rabbyFound = !walletBridge && !!findRabby();
+  $("connect-rabby").hidden = !rabbyFound;
+  $("connect-rabby").className = provider && walletLabel === "Rabby" ? "primary" : "";
+  $("connect-rabby").textContent =
+    provider && walletLabel === "Rabby" ? "Reconnect Rabby" : "Connect Rabby";
+  const callRow = selectedCallRow();
+  const target = CHAINS[callRow?.network ?? "sepolia"];
+  $("switch-network").hidden = !provider || walletChain === target.id;
+  $("switch-network").textContent = `Switch to ${target.name}`;
+  $("add-network").hidden = !provider;
+  $("add-network").textContent = `Add ${target.name} to ${walletLabel}`;
+  $("connect").className = !provider || walletLabel === "MetaMask" ? "primary" : "";
   $("connect").textContent = desktopAvailable
-    ? account && !walletBridge
+    ? account && !walletBridge && walletLabel === "MetaMask"
       ? "Reconnect MetaMask"
-      : "Connect desktop MetaMask"
+      : "Connect MetaMask"
     : "Connect via WalletConnect";
   if (snapshot) {
     document.querySelector(".eyebrow").textContent = snapshot.label || "TRANSACTION SIMULATOR";
@@ -1615,6 +2352,17 @@ $("connect").onclick = () =>
     }
     await connect();
   });
+$("connect-rabby").onclick = () => run(() => useWallet(findRabby(), "Rabby"));
+$("switch-network").onclick = () =>
+  run(() => switchChain(selectedCallRow() ?? { network: "sepolia", chainId: CHAINS.sepolia.id }));
+$("add-network").onclick = () =>
+  run(() =>
+    addChainTo(
+      provider,
+      walletLabel,
+      selectedCallRow() ?? { network: "sepolia", chainId: CHAINS.sepolia.id }
+    )
+  );
 $("connect-walletconnect").onclick = () =>
   run(async () => {
     requireThat(walletConnectBridge, "Use the single-file build for WalletConnect.");

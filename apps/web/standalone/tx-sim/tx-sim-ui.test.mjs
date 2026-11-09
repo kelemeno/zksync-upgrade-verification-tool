@@ -497,3 +497,142 @@ test("another PR opens its own execution plan without restoring Testnet 3 voting
     }
   }
 });
+
+test("MetaMask may stay unresolved while calls remain reviewable and another send stays blocked", async () => {
+  const rows = [1, 2].map((n) => ({
+    network: "sepolia",
+    from: ADDRESSES.control,
+    to: ADDRESSES.token,
+    value: "0",
+    data: `0xd4d9bdcd${String(n).repeat(64)}`,
+    tag: "approve_acceptance",
+    description: `Approval ${n}`,
+  }));
+  const other = {
+    ...rows[0],
+    data: `0xd4d9bdcd${"3".repeat(64)}`,
+    description: "Another group approval",
+  };
+  const stage = async (title, path, calls) => {
+    const raw = JSON.stringify(calls);
+    return { title, path, raw, sha256: await sha256(raw) };
+  };
+  const snapshot = {
+    repo: "matter-labs/transaction-simulator",
+    number: 387,
+    commit: "d".repeat(40),
+    pinnedAt: "2026-10-22T10:00:00Z",
+    stages: [
+      await stage("Approvals", "approvals.json", rows),
+      await stage("Other group", "other.json", [other]),
+    ],
+  };
+  const dom = new JSDOM(readFileSync(new URL("./tx-sim.html", import.meta.url), "utf8"), {
+    url: "http://127.0.0.1:8765/tx-sim.html",
+  });
+  const requests = [];
+  const deferred = [];
+  const copied = [];
+  dom.window.ethers = ethers;
+  dom.window.__TX_SIM_BOOTSTRAP__ = { abis, snapshot };
+  dom.window.ethereum = {
+    isMetaMask: true,
+    request: async (request) => {
+      if (request.method === "eth_accounts") return [ADDRESSES.control];
+      if (request.method === "eth_chainId") return "0xaa36a7";
+      assert.equal(request.method, "eth_sendTransaction");
+      requests.push(request);
+      return new Promise((resolve, reject) => deferred.push({ resolve, reject }));
+    },
+  };
+  Object.defineProperty(dom.window.navigator, "locks", {
+    value: { request: async (_name, _options, fn) => fn({ name: "wallet lock" }) },
+  });
+  Object.defineProperty(dom.window.navigator, "clipboard", {
+    value: { writeText: async (value) => copied.push(value) },
+  });
+  const values = {
+    window: dom.window,
+    document: dom.window.document,
+    Node: dom.window.Node,
+    Event: dom.window.Event,
+    localStorage: dom.window.localStorage,
+    navigator: dom.window.navigator,
+    setInterval: () => 0,
+    fetch: async (url, options) => {
+      if (url === "./tx-sim-package.json") return { ok: true, json: async () => snapshot };
+      const { method } = JSON.parse(options.body);
+      const data = {
+        eth_chainId: "0xaa36a7",
+        eth_call: "0x",
+        eth_estimateGas: "0x10000",
+        eth_getBalance: "0xde0b6b3a7640000",
+        eth_getBlockByNumber: { number: "0x100", timestamp: "0x100", baseFeePerGas: "0x1" },
+        eth_gasPrice: "0x2",
+      };
+      assert.ok(Object.hasOwn(data, method), method);
+      return { ok: true, json: async () => ({ result: data[method] }) };
+    },
+  };
+  const saved = Object.fromEntries(
+    Object.keys(values).map((k) => [k, Object.getOwnPropertyDescriptor(globalThis, k)])
+  );
+  const until = async (condition) => {
+    for (let i = 0; i < 200 && !condition(); i++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(condition());
+  };
+  const send = () =>
+    [...document.querySelectorAll("#transaction button")].find(
+      (b) => b.textContent === "Send to MetaMask"
+    );
+  try {
+    for (const [k, v] of Object.entries(values))
+      Object.defineProperty(globalThis, k, { value: v, configurable: true, writable: true });
+    await import(`./tx-sim-ui.mjs?wallet-wait=${Date.now()}`);
+    await until(() => send() && !send().disabled);
+    send().click();
+    await until(() => requests.length === 1);
+    assert.match(
+      document.getElementById("wallet-activity").textContent,
+      /Waiting for MetaMask: Approval 1/
+    );
+    const calls = document.querySelectorAll("#calls .call-button");
+    assert.equal(calls[1].disabled, false);
+    calls[1].click();
+    assert.match(document.getElementById("transaction").textContent, /Approval 2/);
+    assert.equal(send().disabled, true);
+    const copy = [...document.querySelectorAll("#transaction button")].find(
+      (b) => b.textContent === "Copy calldata"
+    );
+    assert.equal(copy.disabled, false);
+    copy.click();
+    await until(() => copied.length === 1);
+    assert.equal(copied[0], rows[1].data);
+    assert.equal(requests.length, 1);
+    document.querySelectorAll("#bundles .bundle-button")[1].click();
+    assert.match(document.getElementById("transaction").textContent, /Another group approval/);
+    assert.equal(send().disabled, true);
+    send().dispatchEvent(new dom.window.Event("click"));
+    assert.equal(requests.length, 1);
+    assert.equal(document.getElementById("load-pr").disabled, true);
+    deferred[0].reject(Object.assign(Error("User rejected"), { code: 4001 }));
+    await until(() => document.getElementById("wallet-activity").hidden && !send().disabled);
+    assert.match(document.getElementById("transaction").textContent, /Another group approval/);
+    assert.equal(
+      Object.values(JSON.parse(localStorage.getItem(STORAGE.journal)))[0].status,
+      "rejected"
+    );
+    assert.equal(requests[0].params[0].data, rows[0].data);
+    send().click();
+    await until(() => requests.length === 2);
+    assert.equal(requests[1].params[0].data, other.data);
+    deferred[1].reject(Object.assign(Error("User rejected"), { code: 4001 }));
+    await until(() => document.getElementById("wallet-activity").hidden && !send().disabled);
+  } finally {
+    dom.window.close();
+    for (const [k, v] of Object.entries(saved)) {
+      if (v) Object.defineProperty(globalThis, k, v);
+      else delete globalThis[k];
+    }
+  }
+});

@@ -17,15 +17,18 @@ export function upgradeSources(_bundles, _vote, _c) {
         !same(proposal.upgradeId, _vote.upgradeId)
       )
         return [];
+      // The page adds a startUpgrade row after each proposal; it is not part of the L2 sequence.
       if (
-        !_bundle.rows.every((_row) => {
-          const action = governorAction(_row, _c);
-          return (
-            action &&
-            same(_row.from, _vote.from ?? ADDRESSES.control) &&
-            BigInt(action.proposalId) === BigInt(proposal.proposalId)
-          );
-        })
+        !_bundle.rows
+          .filter((_row) => !_row.startFor)
+          .every((_row) => {
+            const action = governorAction(_row, _c);
+            return (
+              action &&
+              same(_row.from, _vote.from ?? ADDRESSES.control) &&
+              BigInt(action.proposalId) === BigInt(proposal.proposalId)
+            );
+          })
       )
         return [];
       return [{ index: _index, bundle: _bundle, proposal }];
